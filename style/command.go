@@ -32,6 +32,5 @@ func (o Options) Run() error {
 		}
 		text = strings.Join(lines, "\n")
 	}
-	tty.Println(o.Style.ToLipgloss().Render(text))
-	return nil
+	return tty.Println(o.Style.ToLipgloss().Render(text))
 }

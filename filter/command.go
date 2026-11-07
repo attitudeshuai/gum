@@ -84,8 +84,7 @@ func (o Options) Run() error {
 	}
 
 	if o.SelectIfOne && len(matches) == 1 {
-		tty.Println(matches[0].Str)
-		return nil
+		return tty.Println(matches[0].Str)
 	}
 
 	km := defaultKeymap()
@@ -157,18 +156,18 @@ func (o Options) Run() error {
 	// than 1 or if flag --no-limit is passed, hence there is
 	// no need to further checks
 	if len(m.selected) > 0 {
-		o.checkSelected(m)
+		return o.checkSelected(m)
 	} else if len(m.matches) > m.cursor && m.cursor >= 0 {
-		tty.Println(m.matches[m.cursor].Str)
+		return tty.Println(m.matches[m.cursor].Str)
 	}
 
 	return nil
 }
 
-func (o Options) checkSelected(m model) {
+func (o Options) checkSelected(m model) error {
 	out := make([]string, 0, len(m.selected))
 	for k := range m.selected {
 		out = append(out, k)
 	}
-	tty.Println(strings.Join(out, o.OutputDelimiter))
+	return tty.Println(strings.Join(out, o.OutputDelimiter))
 }

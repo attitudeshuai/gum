@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/gum/v2/internal/exit"
+	"charm.land/gum/v2/internal/tty"
 	"charm.land/lipgloss/v2"
 	"github.com/alecthomas/kong"
 )
@@ -28,6 +31,18 @@ var (
 )
 
 var bubbleGumPink = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+
+func init() {
+	// By default a SIGPIPE caused by writing to stdout (or stderr) kills
+	// the whole process, so an early-closing downstream such as
+	// `gum style ... | head -1` would terminate gum with SIGPIPE instead
+	// of an observable write result. Asking for the notification makes the
+	// failing write return syscall.EPIPE, where it can be handled like any
+	// other write failure; unlike signal.Ignore, child processes (for
+	// example those spawned by `gum spin`) still receive the default
+	// disposition at exec time.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
+}
 
 func main() {
 	if Version == "" {
@@ -73,6 +88,12 @@ func main() {
 		},
 	)
 	if err := ctx.Run(); err != nil {
+		// The downstream closed the pipe before the result was fully read.
+		// Like standard Unix filters, stop quietly and report success; the
+		// result stream stays untouched and nothing is printed.
+		if errors.Is(err, tty.ErrBrokenPipe) {
+			return
+		}
 		var ex exit.ErrExit
 		if errors.As(err, &ex) {
 			os.Exit(int(ex))

@@ -28,6 +28,5 @@ func (o Options) Run() error {
 	if o.Vertical {
 		join = lipgloss.JoinVertical
 	}
-	tty.Println(join(decode.Align[o.Align], o.Text...))
-	return nil
+	return tty.Println(join(decode.Align[o.Align], o.Text...))
 }

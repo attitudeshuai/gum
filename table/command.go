@@ -124,8 +124,7 @@ func (o Options) Run() error {
 				return styles.Cell
 			})
 
-		tty.Println(table.Render())
-		return nil
+		return tty.Println(table.Render())
 	}
 
 	opts := []table.Option{

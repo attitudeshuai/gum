@@ -169,6 +169,5 @@ func (o Options) Run() error {
 			out = append(out, options[item.text])
 		}
 	}
-	tty.Println(strings.Join(out, o.OutputDelimiter))
-	return nil
+	return tty.Println(strings.Join(out, o.OutputDelimiter))
 }
