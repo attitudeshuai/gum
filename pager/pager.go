@@ -5,6 +5,7 @@ package pager
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/help"
@@ -14,6 +15,17 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/ansi/parser"
+)
+
+const (
+	// minLineNumberWidth keeps the historical "   1 │ " look for files
+	// with fewer than four-digit line counts.
+	minLineNumberWidth = 4
+	// gutterSeparator is rendered between the line number and the content.
+	gutterSeparator = " │ "
+	// tabSpacing is the fixed column width used to expand tabs.
+	tabSpacing = "    "
 )
 
 type keymap struct {
@@ -125,8 +137,23 @@ func (m *model) helpView() string {
 	return m.help.View(m.keymap)
 }
 
+// currentSizeMsg rebuilds the window size message that describes the pager's
+// current layout. It is used to reprocess the content without changing any
+// dimensions, so calling it repeatedly (for example while jumping between
+// search matches) cannot accumulate offsets.
+func (m model) currentSizeMsg() tea.WindowSizeMsg {
+	return tea.WindowSizeMsg{
+		Height: m.viewport.Height() + lipgloss.Height(m.helpView()),
+		Width:  m.viewport.Width(),
+	}
+}
+
 func (m *model) processText(msg tea.WindowSizeMsg) {
-	m.viewport.SetHeight(msg.Height - lipgloss.Height(m.helpView()))
+	height := msg.Height - lipgloss.Height(m.helpView())
+	if height < 0 {
+		height = 0
+	}
+	m.viewport.SetHeight(height)
 	m.viewport.SetWidth(msg.Width)
 	textStyle := lipgloss.NewStyle().Width(m.viewport.Width())
 	var text strings.Builder
@@ -136,42 +163,190 @@ func (m *model) processText(msg tea.WindowSizeMsg) {
 	if m.softWrap {
 		vpStyle := m.viewport.Style
 		m.maxWidth -= vpStyle.GetHorizontalBorderSize() + vpStyle.GetHorizontalMargins() + vpStyle.GetHorizontalPadding()
-		if m.showLineNumbers {
-			m.maxWidth -= lipgloss.Width("     │ ")
+	}
+
+	// The line number slot grows with the total number of lines so that
+	// five-digit (and larger) line numbers still line up with the content.
+	numberWidth := 0
+	continuationGutter := ""
+	tildeGutter := ""
+	if m.showLineNumbers {
+		numberWidth = lineNumberSlotWidth(m.content)
+		continuationGutter = strings.Repeat(" ", numberWidth+1) + "│ "
+		tildeGutter = strings.Repeat(" ", numberWidth-1) + "~" + gutterSeparator
+		if m.softWrap {
+			m.maxWidth -= numberWidth + len(gutterSeparator)
 		}
 	}
 
+	// A terminal narrower than the chrome leaves no room for text. Clamp
+	// to one column so the wrapping loop always terminates: content is
+	// truncated instead of stalling the program forever.
+	if m.softWrap && m.maxWidth < 1 {
+		m.maxWidth = 1
+	}
+
 	for i, line := range strings.Split(m.content, "\n") {
-		line = strings.ReplaceAll(line, "\t", "    ")
-		if m.showLineNumbers {
-			text.WriteString(m.lineNumberStyle.Render(fmt.Sprintf("%4d │ ", i+1)))
-		}
-		idx := 0
-		if w := ansi.StringWidth(line); m.softWrap && w > m.maxWidth {
-			for w > idx {
-				if m.showLineNumbers && idx != 0 {
-					text.WriteString(m.lineNumberStyle.Render("     │ "))
+		segments := wrapLine(line, m.maxWidth, m.softWrap)
+		for j, segment := range segments {
+			if m.showLineNumbers {
+				if j == 0 {
+					text.WriteString(m.lineNumberStyle.Render(fmt.Sprintf("%*d"+gutterSeparator, numberWidth, i+1)))
+				} else {
+					text.WriteString(m.lineNumberStyle.Render(continuationGutter))
 				}
-				truncatedLine := ansi.Cut(line, idx, m.maxWidth+idx)
-				idx += m.maxWidth
-				text.WriteString(textStyle.Render(truncatedLine))
-				text.WriteString("\n")
 			}
-		} else {
-			text.WriteString(textStyle.Render(line))
-			text.WriteString("\n")
+			text.WriteString(textStyle.Render(segment))
+			text.WriteByte('\n')
 		}
 	}
 
 	diffHeight := m.viewport.Height() - lipgloss.Height(text.String())
 	if diffHeight > 0 && m.showLineNumbers {
-		remainingLines := "   ~ │ " + strings.Repeat("\n   ~ │ ", diffHeight-1)
-		text.WriteString(m.lineNumberStyle.Render(remainingLines))
+		var remainingLines strings.Builder
+		remainingLines.WriteString(tildeGutter)
+		for range diffHeight - 1 {
+			remainingLines.WriteByte('\n')
+			remainingLines.WriteString(tildeGutter)
+		}
+		text.WriteString(m.lineNumberStyle.Render(remainingLines.String()))
 	}
 	m.viewport.SetContent(text.String())
 }
 
-const heightOffset = 2
+// lineNumberSlotWidth returns the number of columns reserved for line
+// numbers: at least minLineNumberWidth, or as many digits as the total
+// number of lines requires.
+func lineNumberSlotWidth(content string) int {
+	totalLines := strings.Count(content, "\n") + 1
+	width := len(strconv.Itoa(totalLines))
+	if width < minLineNumberWidth {
+		return minLineNumberWidth
+	}
+	return width
+}
+
+// wrapLine expands tabs and splits a single physical line into visual
+// segments whose display width never exceeds maxWidth. The scan is a single
+// linear pass over the line. Splitting happens on grapheme cluster
+// boundaries, so wide and combining characters are never cut in two.
+// Graphemes wider than the available slot (only possible when the slot is a
+// single column) are visually truncated. The function always terminates:
+// every iteration consumes at least one grapheme cluster.
+func wrapLine(line string, maxWidth int, softWrap bool) []string {
+	line = strings.ReplaceAll(line, "\t", tabSpacing)
+	if !softWrap || maxWidth <= 0 {
+		return []string{line}
+	}
+	if ansi.StringWidth(line) <= maxWidth {
+		return []string{line}
+	}
+
+	var (
+		segments []string
+		cur      strings.Builder
+		// carry holds escape sequences preceding a glyph that had to be
+		// truncated; they belong to whatever segment comes next.
+		carry    strings.Builder
+		curWidth int
+		pstate   = parser.GroundState
+	)
+
+	flush := func() {
+		segments = append(segments, cur.String())
+		cur.Reset()
+		curWidth = 0
+	}
+	useCarry := func() {
+		if carry.Len() > 0 {
+			cur.WriteString(carry.String())
+			carry.Reset()
+		}
+	}
+
+	b := []byte(line)
+	for i := 0; i < len(b); {
+		state, action := parser.Table.Transition(pstate, b[i])
+		if state == parser.Utf8State {
+			cluster, width := ansi.FirstGraphemeCluster(b[i:], ansi.GraphemeWidth)
+			i += len(cluster)
+			switch {
+			case width == 0:
+				// Combining mark or other zero-width cluster: it must
+				// stay attached to the preceding grapheme.
+				useCarry()
+				cur.Write(cluster)
+			case width > maxWidth:
+				// The glyph is wider than the entire slot. Flush any
+				// pending content and truncate the glyph itself.
+				if curWidth > 0 {
+					flush()
+				}
+				if cur.Len() > 0 {
+					carry.WriteString(cur.String())
+					cur.Reset()
+				}
+			case curWidth > 0 && curWidth+width > maxWidth:
+				flush()
+				useCarry()
+				cur.Write(cluster)
+				curWidth = width
+			default:
+				useCarry()
+				cur.Write(cluster)
+				curWidth += width
+			}
+			pstate = parser.GroundState
+			continue
+		}
+
+		switch action {
+		case parser.PrintAction:
+			if curWidth > 0 && curWidth+1 > maxWidth {
+				flush()
+			}
+			useCarry()
+			cur.WriteByte(b[i])
+			curWidth++
+		case parser.ExecuteAction:
+			// Control characters occupy no columns.
+			useCarry()
+			cur.WriteByte(b[i])
+		default:
+			// Escape sequences occupy no columns and must survive.
+			useCarry()
+			cur.WriteByte(b[i])
+		}
+		if pstate != parser.Utf8State {
+			pstate = state
+		}
+		i++
+	}
+
+	if curWidth > 0 {
+		flush()
+	}
+	if len(segments) == 0 {
+		// Every glyph was truncated (e.g. wide characters in a
+		// one-column terminal); the physical line still renders once.
+		segments = append(segments, carry.String())
+	}
+	return segments
+}
+
+// wrapContent applies the exact same segmentation used by the view renderer
+// to the whole content, so search match positions map to the same visual
+// line numbers that are displayed.
+func wrapContent(content string, maxWidth int, softWrap bool) string {
+	var text strings.Builder
+	for _, line := range strings.Split(content, "\n") {
+		for _, segment := range wrapLine(line, maxWidth, softWrap) {
+			text.WriteString(segment)
+			text.WriteByte('\n')
+		}
+	}
+	return text.String()
+}
 
 func (m model) keyHandler(msg tea.KeyPressMsg) (model, tea.Cmd) {
 	km := m.keymap
@@ -185,7 +360,7 @@ func (m model) keyHandler(msg tea.KeyPressMsg) (model, tea.Cmd) {
 
 				// Trigger a view update to highlight the found matches.
 				m.search.NextMatch(&m)
-				m.processText(tea.WindowSizeMsg{Height: m.viewport.Height() + heightOffset, Width: m.viewport.Width()})
+				m.processText(m.currentSizeMsg())
 			} else {
 				m.search.Done()
 			}
@@ -205,10 +380,10 @@ func (m model) keyHandler(msg tea.KeyPressMsg) (model, tea.Cmd) {
 			return m, textinput.Blink
 		case key.Matches(msg, km.PrevMatch):
 			m.search.PrevMatch(&m)
-			m.processText(tea.WindowSizeMsg{Height: m.viewport.Height() + heightOffset, Width: m.viewport.Width()})
+			m.processText(m.currentSizeMsg())
 		case key.Matches(msg, km.NextMatch):
 			m.search.NextMatch(&m)
-			m.processText(tea.WindowSizeMsg{Height: m.viewport.Height() + heightOffset, Width: m.viewport.Width()})
+			m.processText(m.currentSizeMsg())
 		case key.Matches(msg, km.Quit):
 			return m, tea.Quit
 		case key.Matches(msg, km.Abort):

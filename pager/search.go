@@ -7,7 +7,6 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/ansi"
 )
 
 type search struct {
@@ -93,18 +92,7 @@ func (s *search) NextMatch(m *model) {
 	s.matchLipglossStr = m.matchHighlightStyle.Render(s.matchString[leftPad : len(s.matchString)-rightPad])
 	m.content = lhs + strings.Replace(rhs, m.content[match[0]:match[1]], s.matchLipglossStr, 1)
 
-	// Update the viewport position.
-	var line int
-	formatStr := softWrapEm(m.content, m.maxWidth, m.softWrap)
-	index := strings.Index(formatStr, s.matchLipglossStr)
-	if index != -1 {
-		line = strings.Count(formatStr[:index], "\n")
-	}
-
-	// Only update if the match is not within the viewport.
-	if index != -1 && (line > m.viewport.YOffset()-1+m.viewport.VisibleLineCount()-1 || line < m.viewport.YOffset()) {
-		m.viewport.SetYOffset(line)
-	}
+	s.gotoMatchLine(m)
 }
 
 func (s *search) PrevMatch(m *model) {
@@ -135,9 +123,16 @@ func (s *search) PrevMatch(m *model) {
 	s.matchLipglossStr = m.matchHighlightStyle.Render(s.matchString[leftPad : len(s.matchString)-rightPad])
 	m.content = lhs + strings.Replace(rhs, m.content[match[0]:match[1]], s.matchLipglossStr, 1)
 
-	// Update the viewport position.
+	s.gotoMatchLine(m)
+}
+
+// gotoMatchLine scrolls the viewport so the highlighted match is visible.
+// The match line is derived from wrapContent, which uses the exact same
+// wrapping and termination rules as the view renderer, so match positions
+// always agree with the displayed line numbers.
+func (s *search) gotoMatchLine(m *model) {
 	var line int
-	formatStr := softWrapEm(m.content, m.maxWidth, m.softWrap)
+	formatStr := wrapContent(m.content, m.maxWidth, m.softWrap)
 	index := strings.Index(formatStr, s.matchLipglossStr)
 	if index != -1 {
 		line = strings.Count(formatStr[:index], "\n")
@@ -147,26 +142,6 @@ func (s *search) PrevMatch(m *model) {
 	if index != -1 && (line > m.viewport.YOffset()-1+m.viewport.VisibleLineCount()-1 || line < m.viewport.YOffset()) {
 		m.viewport.SetYOffset(line)
 	}
-}
-
-func softWrapEm(str string, maxWidth int, softWrap bool) string {
-	var text strings.Builder
-	for _, line := range strings.Split(str, "\n") {
-		idx := 0
-		if w := ansi.StringWidth(line); softWrap && w > maxWidth {
-			for w > idx {
-				truncatedLine := ansi.Cut(line, idx, maxWidth+idx)
-				idx += maxWidth
-				text.WriteString(truncatedLine)
-				text.WriteString("\n")
-			}
-		} else {
-			text.WriteString(line)
-			text.WriteString("\n")
-		}
-	}
-
-	return text.String()
 }
 
 // lipglossPadding calculates how much padding a string is given by a style.
