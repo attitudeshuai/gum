@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"sort"
 	"strings"
 
@@ -30,13 +29,15 @@ func (o Options) Run() error {
 		o.Options = strings.Split(input, o.InputDelimiter)
 	}
 
-	// normalize options into a map
-	options := map[string]string{}
+	// Keep the displayed labels and written values aligned position by
+	// position. Duplicate options keep their own position instead of being
+	// merged into a map keyed by their text.
+	values := make([]string, 0, len(o.Options))
 	// keep the labels in the user-provided order
 	var labels []string
 	for _, opt := range o.Options {
 		if o.LabelDelimiter == "" {
-			options[opt] = opt
+			values = append(values, opt)
 			continue
 		}
 		label, value, ok := strings.Cut(opt, o.LabelDelimiter)
@@ -44,14 +45,14 @@ func (o Options) Run() error {
 			return fmt.Errorf("invalid option format: %q", opt)
 		}
 		labels = append(labels, label)
-		options[label] = value
+		values = append(values, value)
 	}
 	if o.LabelDelimiter != "" {
 		o.Options = labels
 	}
 
 	if o.SelectIfOne && len(o.Options) == 1 {
-		fmt.Println(options[o.Options[0]])
+		fmt.Println(values[0])
 		return nil
 	}
 
@@ -68,37 +69,26 @@ func (o Options) Run() error {
 	}
 
 	if o.Ordered {
-		slices.SortFunc(o.Options, strings.Compare)
-	}
-
-	isSelectAll := len(o.Selected) == 1 && o.Selected[0] == "*"
-
-	// Keep track of the selected items.
-	currentSelected := 0
-	// Check if selected items should be used.
-	hasSelectedItems := len(o.Selected) > 0
-	startingIndex := 0
-	currentOrder := 0
-	items := make([]item, len(o.Options))
-	for i, option := range o.Options {
-		var order int
-		// Check if the option should be selected.
-		isSelected := hasSelectedItems && currentSelected < o.Limit && (isSelectAll || slices.Contains(o.Selected, option))
-		// If the option is selected then increment the current selected count.
-		if isSelected {
-			if o.Limit == 1 {
-				// When the user can choose only one option don't select the option but
-				// start with the cursor hovering over it.
-				startingIndex = i
-				isSelected = false
-			} else {
-				currentSelected++
-				order = currentOrder
-				currentOrder++
-			}
+		// Sort labels and values together so positions stay aligned after
+		// sorting. Stable sorting keeps repeated options in list order.
+		permutation := make([]int, len(o.Options))
+		for i := range permutation {
+			permutation[i] = i
 		}
-		items[i] = item{text: option, selected: isSelected, order: order}
+		sort.SliceStable(permutation, func(a, b int) bool {
+			return o.Options[permutation[a]] < o.Options[permutation[b]]
+		})
+		sortedOptions := make([]string, len(o.Options))
+		sortedValues := make([]string, len(values))
+		for i, idx := range permutation {
+			sortedOptions[i] = o.Options[idx]
+			sortedValues[i] = values[idx]
+		}
+		o.Options = sortedOptions
+		values = sortedValues
 	}
+
+	items, startingIndex, currentOrder, currentSelected := buildItems(o.Options, values, o.Selected, o.Limit)
 
 	// Use the pagination model to display the current and total number of
 	// pages.
@@ -163,12 +153,51 @@ func (o Options) Run() error {
 		})
 	}
 
-	var out []string
-	for _, item := range m.items {
-		if item.selected {
-			out = append(out, options[item.text])
+	tty.Println(strings.Join(m.selectedValues(), o.OutputDelimiter))
+	return nil
+}
+
+// buildItems turns the provided options into items and applies the
+// pre-selected texts. Pre-selection is matched by position: every pre-selected
+// text consumes one occurrence in list order, so repeated options map to their
+// own positions instead of being merged by text. It returns the items, the
+// initial cursor position, the next selection order counter and the number of
+// pre-selected items.
+func buildItems(options, values, selected []string, limit int) (items []item, startingIndex, currentOrder, currentSelected int) {
+	isSelectAll := len(selected) == 1 && selected[0] == "*"
+
+	// Remaining pre-selected occurrences keyed by option text.
+	remaining := map[string]int{}
+	if len(selected) > 0 && !isSelectAll {
+		for _, s := range selected {
+			remaining[s]++
 		}
 	}
-	tty.Println(strings.Join(out, o.OutputDelimiter))
-	return nil
+
+	items = make([]item, len(options))
+	for i, option := range options {
+		var order int
+		_, isPreSelected := remaining[option]
+		// Check if the option should be selected.
+		isSelected := len(selected) > 0 && currentSelected < limit && (isSelectAll || isPreSelected)
+		// If the option is selected then increment the current selected count.
+		if isSelected {
+			if limit == 1 {
+				// When the user can choose only one option don't select the option but
+				// start with the cursor hovering over it.
+				startingIndex = i
+				isSelected = false
+			} else {
+				remaining[option]--
+				if remaining[option] == 0 {
+					delete(remaining, option)
+				}
+				currentSelected++
+				order = currentOrder
+				currentOrder++
+			}
+		}
+		items[i] = item{text: option, value: values[i], selected: isSelected, order: order}
+	}
+	return items, startingIndex, currentOrder, currentSelected
 }

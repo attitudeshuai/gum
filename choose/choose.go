@@ -126,8 +126,23 @@ type model struct {
 
 type item struct {
 	text     string
+	value    string
 	selected bool
 	order    int
+}
+
+// selectedValues returns the values of the selected items in their current
+// slice order. Items keep their position in the list, so duplicate options are
+// tracked and written independently and the output order does not depend on
+// the iteration order of any map.
+func (m model) selectedValues() []string {
+	out := make([]string, 0, m.numSelected)
+	for i := range m.items {
+		if m.items[i].selected {
+			out = append(out, m.items[i].value)
+		}
+	}
+	return out
 }
 
 func (m model) Init() tea.Cmd { return tea.RequestBackgroundColor }

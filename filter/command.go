@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 
 	"charm.land/bubbles/v2/help"
@@ -63,11 +62,14 @@ func (o Options) Run() error {
 		i.SetValue(o.Value)
 	}
 
-	choices := map[string]string{}
-	filteringChoices := []string{}
+	// Keep one entry per option, in list order. Selection is tracked by the
+	// position in these slices, so repeated options keep independent
+	// identities instead of being merged by text in a map.
+	choices := make([]string, 0, len(o.Options))
+	filteringChoices := make([]string, 0, len(o.Options))
 	for _, opt := range o.Options {
 		s := ansi.Strip(opt)
-		choices[s] = opt
+		choices = append(choices, opt)
 		filteringChoices = append(filteringChoices, s)
 	}
 	switch {
@@ -115,7 +117,7 @@ func (o Options) Run() error {
 		cursorTextStyle:       o.CursorTextStyle.ToLipgloss(),
 		height:                o.Height,
 		padding:               []int{top, right, bottom, left},
-		selected:              make(map[string]struct{}),
+		selected:              make(map[int]struct{}),
 		limit:                 o.Limit,
 		reverse:               o.Reverse,
 		fuzzy:                 o.Fuzzy,
@@ -126,21 +128,11 @@ func (o Options) Run() error {
 		help:                  help.New(),
 	}
 
-	isSelectAll := len(o.Selected) == 1 && o.Selected[0] == "*"
-	currentSelected := 0
 	if len(o.Selected) > 0 {
-		for i, option := range matches {
-			if currentSelected >= o.Limit || (!isSelectAll && !slices.Contains(o.Selected, option.Str)) {
-				continue
-			}
-			if o.Limit == 1 {
-				m.cursor = i
-				m.selected[option.Str] = struct{}{}
-			} else {
-				currentSelected++
-				m.selected[option.Str] = struct{}{}
-			}
-		}
+		selected, cursor, count := preselect(matches, o.Selected, o.Limit)
+		m.selected = selected
+		m.cursor = cursor
+		m.numSelected = count
 	}
 
 	tm, err := tea.NewProgram(m, options...).Run()
@@ -165,10 +157,67 @@ func (o Options) Run() error {
 	return nil
 }
 
-func (o Options) checkSelected(m model) {
-	out := make([]string, 0, len(m.selected))
-	for k := range m.selected {
-		out = append(out, k)
+// preselect applies the pre-selected texts onto the given matches. Texts are
+// consumed one-to-one in list order, so repeated options land on their own
+// positions instead of selecting every occurrence. In single-select mode no
+// position is marked, only the cursor is moved to the last matching option.
+// It returns the selected positions, the cursor position and the number of
+// selected positions (never exceeding the limit).
+func preselect(matches []fuzzy.Match, preselected []string, limit int) (map[int]struct{}, int, int) {
+	isSelectAll := len(preselected) == 1 && preselected[0] == "*"
+
+	// Remaining pre-selected occurrences keyed by option text.
+	remaining := map[string]int{}
+	if !isSelectAll {
+		for _, s := range preselected {
+			remaining[s]++
+		}
 	}
+
+	selected := make(map[int]struct{})
+	cursor, count := 0, 0
+	for i, option := range matches {
+		if count >= limit {
+			break
+		}
+		if !isSelectAll && remaining[option.Str] == 0 {
+			continue
+		}
+		if limit == 1 {
+			// Single selection only hovers the cursor over the last matching
+			// option without marking anything.
+			cursor = i
+			continue
+		}
+		if !isSelectAll {
+			remaining[option.Str]--
+		}
+		selected[option.Index] = struct{}{}
+		count++
+	}
+	return selected, cursor, count
+}
+
+func (o Options) checkSelected(m model) {
+	out := m.selectedOutput()
 	tty.Println(strings.Join(out, o.OutputDelimiter))
+}
+
+// selectedOutput returns the selected choices in the order in which the
+// options were provided. Selection is tracked by position, hence duplicate
+// options are written independently and repeated runs produce byte-identical
+// output instead of depending on map iteration order.
+func (m model) selectedOutput() []string {
+	out := make([]string, 0, m.numSelected)
+	for i, choice := range m.filteringChoices {
+		if _, ok := m.selected[i]; ok {
+			out = append(out, choice)
+		}
+	}
+	// The typed query itself (non-strict mode) has no list position; write it
+	// after the list entries so the list-order part of the output is stable.
+	if _, ok := m.selected[typedChoiceIndex]; ok {
+		out = append(out, m.textinput.Value())
+	}
+	return out
 }

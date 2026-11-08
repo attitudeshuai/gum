@@ -123,15 +123,20 @@ func (k keymap) ShortHelp() []key.Binding {
 	}
 }
 
+// typedChoiceIndex is the synthetic position assigned to the typed query
+// itself when strict mode is disabled. It is not part of the provided options
+// and therefore has no list position.
+const typedChoiceIndex = -1
+
 type model struct {
 	textinput             textinput.Model
 	viewport              *viewport.Model
-	choices               map[string]string
+	choices               []string
 	filteringChoices      []string
 	matches               []fuzzy.Match
 	cursor                int
 	header                string
-	selected              map[string]struct{}
+	selected              map[int]struct{}
 	limit                 int
 	numSelected           int
 	indicator             string
@@ -197,7 +202,7 @@ func (m model) View() tea.View {
 		}
 
 		// If there are multiple selections mark them, otherwise leave an empty space
-		if _, ok := m.selected[match.Str]; ok {
+		if _, ok := m.selected[match.Index]; ok {
 			s.WriteString(m.selectedPrefixStyle.Render(m.selectedPrefix))
 		} else if m.limit > 1 {
 			s.WriteString(m.unselectedPrefixStyle.Render(m.unselectedPrefix))
@@ -205,7 +210,13 @@ func (m model) View() tea.View {
 			s.WriteString(" ")
 		}
 
-		styledOption := m.choices[match.Str]
+		// Selection is tracked by position: repeated texts keep their own
+		// styling instead of sharing a single map entry. The synthetic typed
+		// choice has no list position, so render its text as-is.
+		styledOption := match.Str
+		if match.Index != typedChoiceIndex {
+			styledOption = m.choices[match.Index]
+		}
 		if len(match.MatchedIndexes) == 0 {
 			// No matches, just render the text.
 			s.WriteString(lineTextStyle.Render(styledOption))
@@ -328,7 +339,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 			m.viewport.GotoTop()
 		case key.Matches(msg, km.End):
-			m.cursor = len(m.choices) - 1
+			m.cursor = len(m.matches) - 1
 			m.viewport.GotoBottom()
 		case key.Matches(msg, km.ToggleAndNext):
 			if m.limit == 1 {
@@ -368,25 +379,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// A character was entered, this likely means that the text input has
 			// changed. This suggests that the matches are outdated, so update them.
-			var choices []string
-			if !m.strict {
-				choices = append(choices, m.textinput.Value())
-			}
-			choices = append(choices, m.filteringChoices...)
+			// Matching always runs against the full list so each match keeps its
+			// original position, even while a subset is visible.
+			query := m.textinput.Value()
 			if m.fuzzy {
 				if m.sort {
-					m.matches = fuzzy.Find(m.textinput.Value(), choices)
+					m.matches = fuzzy.Find(query, m.filteringChoices)
 				} else {
-					m.matches = fuzzy.FindNoSort(m.textinput.Value(), choices)
+					m.matches = fuzzy.FindNoSort(query, m.filteringChoices)
 				}
 			} else {
-				m.matches = exactMatches(m.textinput.Value(), choices)
+				m.matches = exactMatches(query, m.filteringChoices)
 			}
 
 			// If the search field is empty, let's not display the matches
 			// (none), but rather display all possible choices.
-			if m.textinput.Value() == "" {
+			if query == "" {
 				m.matches = matchAll(m.filteringChoices)
+			} else if !m.strict {
+				// In non-strict mode the typed query itself is a selectable
+				// choice. It carries no position in the original list and is
+				// prepended so it stays the first candidate.
+				m.matches = append(fuzzy.Matches{{
+					Str:            query,
+					Index:          typedChoiceIndex,
+					MatchedIndexes: selfMatchedIndexes(query),
+				}}, m.matches...)
 			}
 
 			// For reverse layout, we need to offset the viewport so that the
@@ -458,11 +476,14 @@ func (m *model) CursorDown() {
 }
 
 func (m *model) ToggleSelection() {
-	if _, ok := m.selected[m.matches[m.cursor].Str]; ok {
-		delete(m.selected, m.matches[m.cursor].Str)
+	// Toggles act on the position of the match in the original list, so
+	// repeated texts can be selected and cancelled independently.
+	id := m.matches[m.cursor].Index
+	if _, ok := m.selected[id]; ok {
+		delete(m.selected, id)
 		m.numSelected--
 	} else if m.numSelected < m.limit {
-		m.selected[m.matches[m.cursor].Str] = struct{}{}
+		m.selected[id] = struct{}{}
 		m.numSelected++
 	}
 }
@@ -472,17 +493,18 @@ func (m model) selectAll() model {
 		if m.numSelected >= m.limit {
 			break // do not exceed given limit
 		}
-		if _, ok := m.selected[m.matches[i].Str]; ok {
+		id := m.matches[i].Index
+		if _, ok := m.selected[id]; ok {
 			continue
 		}
-		m.selected[m.matches[i].Str] = struct{}{}
+		m.selected[id] = struct{}{}
 		m.numSelected++
 	}
 	return m
 }
 
 func (m model) deselectAll() model {
-	m.selected = make(map[string]struct{})
+	m.selected = make(map[int]struct{})
 	m.numSelected = 0
 	return m
 }
@@ -490,9 +512,20 @@ func (m model) deselectAll() model {
 func matchAll(options []string) []fuzzy.Match {
 	matches := make([]fuzzy.Match, len(options))
 	for i, option := range options {
-		matches[i] = fuzzy.Match{Str: option}
+		matches[i] = fuzzy.Match{Str: option, Index: i}
 	}
 	return matches
+}
+
+// selfMatchedIndexes returns the matched indexes of a string matching itself,
+// one per rune, mirroring what the matcher would highlight for the synthetic
+// typed choice in non-strict mode.
+func selfMatchedIndexes(s string) []int {
+	indexes := make([]int, 0, len(s))
+	for i := range s {
+		indexes = append(indexes, i)
+	}
+	return indexes
 }
 
 func exactMatches(search string, choices []string) []fuzzy.Match {
