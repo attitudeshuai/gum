@@ -53,6 +53,12 @@ func (o Options) Run() error {
 	a.SetHeight(max(0, o.Height-top-bottom))
 	a.SetValue(o.Value)
 
+	// Track every temporary file created for an external editor so that no
+	// file survives the session, including cancellation or interruption
+	// paths that never run the editor callback.
+	temps := &tempFiles{}
+	defer temps.cleanup()
+
 	m := model{
 		textarea:    a,
 		header:      o.Header,
@@ -62,6 +68,7 @@ func (o Options) Run() error {
 		showHelp:    o.ShowHelp,
 		keymap:      defaultKeymap(),
 		padding:     []int{top, right, bottom, left},
+		temps:       temps,
 	}
 
 	m.textarea.KeyMap.InsertNewline = m.keymap.InsertNewline
